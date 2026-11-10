@@ -36,7 +36,7 @@ Per layer at 128K, K% spans 47.3 (layer 11) to 60.3 (layer 7). No layer escapes.
 ## Reading
 
 - **K% falls, but slowly: about context^−0.23.** The 16K–64K fit predicted 55% at 128K; it came in
-  at 52.4%. §05 measured 55.9% at 100K on the 9B; this run gives ~57% at 100K. A different model and
+  at 52.4%. §05 measured 55.9% at 100K on the 9B; this run gives ~56% at 100K. A different model and
   graph builder land on the same number, so the trend looks real.
 - **Extrapolation (4 points, log-log):** ~48% at 200K, ~33% at 1M. V% falls faster
   (~context^−0.52), ~5% at 1M.
