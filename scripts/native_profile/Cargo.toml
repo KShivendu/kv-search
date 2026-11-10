@@ -1,0 +1,17 @@
+[package]
+name = "native_profile"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# standalone: not part of the kv-search extension build
+[workspace]
+
+[dependencies]
+qdrant-edge = { package = "edge", git = "https://github.com/qdrant/qdrant.git", rev = "2ef887bae1e840b7b3bceb9b94b23589eaff4693" }
+rayon = "1.12.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+debug = 1
