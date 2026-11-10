@@ -14,6 +14,8 @@ Output <out>/:
 
 import argparse
 import copy
+import ctypes
+import gc
 import importlib.util
 import json
 import time
@@ -77,6 +79,8 @@ def main() -> None:
         "lib/collection/src", "lib/segment/src", "lib/storage/src", "src", "lib/shard/src"])
     ap.add_argument("--lengths", type=int, nargs="+", default=[16384, 32768, 65536, 131072])
     ap.add_argument("--gen", type=int, default=256)
+    ap.add_argument("--ask-at", type=int, nargs="*", default=None,
+                    help="checkpoints to run questions at (default: all)")
     ap.add_argument("--questions", nargs="+", required=True)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -107,12 +111,19 @@ def main() -> None:
     with torch.no_grad():
         for n in lengths:
             while pos < n:
-                step = min(2048, n - pos)
+                # past 64K, smaller chunks keep CPU attention scores (q x N x heads) in memory
+                step = min(2048 if pos < 65536 else 512, n - pos)
                 o = model(input_ids=ctx_ids[:, pos:pos + step], past_key_values=cache,
                           use_cache=True, logits_to_keep=1)
                 cache = o.past_key_values
                 pos += step
                 print(f"  prefill {pos}/{N}  {time.time() - t0:.0f}s", flush=True)
+            if n == lengths[-1]:
+                save_keys(cache, full, out_dir)
+            gc.collect()
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+            if args.ask_at is not None and n not in args.ask_at:
+                continue
             qt: dict[str, torch.Tensor] = {}
             runs = []
             for j, q in enumerate(args.questions):
@@ -141,14 +152,20 @@ def main() -> None:
                 runs.append({"q_tokens": q_ids.shape[1], "gen": len(gen), "answer": ans})
                 print(f"[{n}] Q{j}: {len(gen)} tok  {ans[:120]!r}  ({time.time() - t0:.0f}s)", flush=True)
             save_file(qt, out_dir / f"q_{n}.safetensors")
+            meta_path = out_dir / "meta.json"
+            if meta_path.exists():  # keep runs recorded by an earlier, partial capture
+                old = json.loads(meta_path.read_text())
+                meta["runs"] = {**old.get("runs", {}), **meta["runs"]}
+                meta["lengths"] = sorted(set(old.get("lengths", [])) | set(meta["lengths"]))
             meta["runs"][str(n)] = runs
-            (out_dir / "meta.json").write_text(json.dumps(meta, indent=1))
-    keys = {}
-    for L in full:
-        k = cache.layers[L].keys[0]
-        keys[f"k_{L}"] = k.half().contiguous()
+            meta_path.write_text(json.dumps(meta, indent=1))
+    print("done", out_dir, f"{time.time() - t0:.0f}s", flush=True)
+
+
+def save_keys(cache, full: list[int], out_dir: Path) -> None:
+    keys = {f"k_{L}": cache.layers[L].keys[0].half().contiguous() for L in full}
     save_file(keys, out_dir / "keys.safetensors")
-    print("saved", out_dir, f"{time.time() - t0:.0f}s", flush=True)
+    print("saved keys", flush=True)
 
 
 if __name__ == "__main__":
