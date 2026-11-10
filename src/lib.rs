@@ -4,7 +4,9 @@ mod tail;
 
 #[pymodule]
 mod _native {
-    use std::{collections::HashMap, path::Path};
+    use std::{collections::HashMap, fs::File, io::Write, path::Path};
+
+    use memmap2::Mmap;
 
     use numpy::{
         PyArray1, PyArray2, PyArray3, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
@@ -13,12 +15,18 @@ mod _native {
     use pyo3::exceptions::{PyRuntimeError, PyValueError};
     use pyo3::prelude::*;
     use qdrant_edge::{
-        EdgeConfigBuilder, EdgeShard, NamedQuery, QueryEnum, QueryRequest, ScoringQuery,
-        SearchParams, VectorInternal, VectorStructInternal, WithPayloadInterface, WithVector,
+        EdgeConfigBuilder, EdgeShard, NamedQuery, PointId, QueryEnum, QueryRequest,
+        RetrieveRequestBuilder, ScoringQuery, SearchParams, VectorInternal, VectorStructInternal,
+        WithPayloadInterface, WithVector,
     };
     use rayon::prelude::*;
 
     use crate::tail::{HeadTail, Kernel, head_tail};
+
+    /// Sidecar next to a shard's segments: its "value" vectors as raw little-endian f32
+    /// [n_points, d], row = point id. When present, decode reads values by offset from it instead
+    /// of asking Qdrant for them (`export_values` writes it).
+    const VALUES_SIDECAR: &str = "values.f32";
 
     /// per query row of one KV head: (out, lse, boundary)
     type Rows = Vec<(Vec<f32>, f32, f32)>;
@@ -48,6 +56,8 @@ mod _native {
     #[pyclass]
     struct NativeEdgeRetriever {
         shards: HashMap<(usize, usize), EdgeShard>,
+        // per shard, its mmap'd values sidecar when one exists (VALUES_SIDECAR)
+        values: HashMap<(usize, usize), Mmap>,
         // true: exact top-n (full scan); false: HNSW search with `hnsw_ef` (None -> qdrant-edge's
         // own default, raised to the limit)
         exact: bool,
@@ -76,6 +86,57 @@ mod _native {
                 .collect()
         }
 
+        /// One query row's request: top-`limit` keys, with or without their "value" vectors.
+        fn request(&self, qv: &[f32], limit: usize, with_values: bool) -> QueryRequest {
+            QueryRequest {
+                prefetches: vec![],
+                query: Some(ScoringQuery::Vector(QueryEnum::Nearest(NamedQuery {
+                    query: qv.to_vec().into(),
+                    using: Some("key".to_string()),
+                }))),
+                filter: None,
+                score_threshold: None,
+                limit,
+                offset: 0,
+                params: Some(SearchParams {
+                    exact: self.exact,
+                    hnsw_ef: if self.exact { None } else { self.hnsw_ef },
+                    ..Default::default()
+                }),
+                with_vector: if with_values {
+                    WithVector::Selector(vec!["value".to_string()])
+                } else {
+                    WithVector::Bool(false)
+                },
+                with_payload: WithPayloadInterface::Bool(false),
+            }
+        }
+
+        /// A shard's values sidecar as f32 rows, when it has one.
+        fn sidecar(&self, layer_idx: usize, h: usize) -> Option<&[f32]> {
+            let m = self.values.get(&(layer_idx, h))?;
+            // SAFETY: the mmap is page aligned and read only; VALUES_SIDECAR is raw f32
+            Some(unsafe { std::slice::from_raw_parts(m.as_ptr().cast::<f32>(), m.len() / 4) })
+        }
+
+        /// mmap each shard's VALUES_SIDECAR, when it has one.
+        fn load_sidecars(
+            paths: &[((usize, usize), String)],
+        ) -> PyResult<HashMap<(usize, usize), Mmap>> {
+            let mut out = HashMap::new();
+            for (k, p) in paths {
+                let f = Path::new(p).join(VALUES_SIDECAR);
+                if f.is_file() {
+                    let file = File::open(&f).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    // SAFETY: read-only map of a file only export_values writes (via rename)
+                    let m = unsafe { Mmap::map(&file) }
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    out.insert(*k, m);
+                }
+            }
+            Ok(out)
+        }
+
         /// Search of one KV head's query rows `x` [rows, d] (exact, or HNSW with `hnsw_ef`), then
         /// the kept keys' softmax merge.
         fn search_merge(
@@ -87,27 +148,13 @@ mod _native {
             limit: usize,
             scaling: f32,
         ) -> Result<Rows, String> {
+            if let Some(values) = self.sidecar(layer_idx, h) {
+                return self.search_merge_sidecar(layer_idx, h, x, d, limit, scaling, values);
+            }
             let batch = self.shards[&(layer_idx, h)]
                 .query_batch(
                     x.chunks_exact(d)
-                        .map(|qv| QueryRequest {
-                            prefetches: vec![],
-                            query: Some(ScoringQuery::Vector(QueryEnum::Nearest(NamedQuery {
-                                query: qv.to_vec().into(),
-                                using: Some("key".to_string()),
-                            }))),
-                            filter: None,
-                            score_threshold: None,
-                            limit,
-                            offset: 0,
-                            params: Some(SearchParams {
-                                exact: self.exact,
-                                hnsw_ef: if self.exact { None } else { self.hnsw_ef },
-                                ..Default::default()
-                            }),
-                            with_vector: WithVector::Selector(vec!["value".to_string()]),
-                            with_payload: WithPayloadInterface::Bool(false),
-                        })
+                        .map(|qv| self.request(qv, limit, true))
                         .collect(),
                 )
                 .map_err(|e| e.to_string())?;
@@ -156,6 +203,70 @@ mod _native {
                 .collect::<Result<Vec<_>, String>>()
         }
 
+        /// `search_merge` for a shard with a values sidecar: every query row is its own search
+        /// (rows run in parallel, so a layer's 16 searches spread over all cores instead of 4
+        /// serial batches), Qdrant returns ids and scores only, and the merge reads values by
+        /// offset from the sidecar. Same math as the batch path.
+        #[allow(clippy::too_many_arguments)]
+        fn search_merge_sidecar(
+            &self,
+            layer_idx: usize,
+            h: usize,
+            x: &[f32],
+            d: usize,
+            limit: usize,
+            scaling: f32,
+            values: &[f32],
+        ) -> Result<Rows, String> {
+            let shard = &self.shards[&(layer_idx, h)];
+            let n_rows = values.len() / d;
+            if values.len() % d != 0 {
+                return Err(format!(
+                    "{VALUES_SIDECAR} of layer {layer_idx} head {h}: {} floats, not a multiple of d={d}",
+                    values.len()
+                ));
+            }
+            x.par_chunks_exact(d)
+                .map(|qv| {
+                    let points = shard
+                        .query(self.request(qv, limit, false))
+                        .map_err(|e| e.to_string())?;
+                    let m = points
+                        .iter()
+                        .map(|p| p.score * scaling)
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    let boundary = points
+                        .iter()
+                        .map(|p| p.score * scaling)
+                        .fold(f32::INFINITY, f32::min);
+                    let mut out = vec![0.0f32; d];
+                    let mut sum = 0.0f32;
+                    for p in &points {
+                        let PointId::NumId(id) = p.id else {
+                            return Err("values sidecar needs numeric point ids".to_string());
+                        };
+                        let id = id as usize;
+                        if id >= n_rows {
+                            return Err(format!(
+                                "point id {id} past {VALUES_SIDECAR} rows {n_rows} (layer {layer_idx}, head {h})"
+                            ));
+                        }
+                        let v = &values[id * d..(id + 1) * d];
+                        let w = (p.score * scaling - m).exp();
+                        sum += w;
+                        for (o, x) in out.iter_mut().zip(v) {
+                            *o += w * x;
+                        }
+                    }
+                    let inv = 1.0 / sum;
+                    for o in out.iter_mut() {
+                        *o *= inv;
+                    }
+                    Ok((out, m + sum.ln(), boundary))
+                })
+                .collect()
+        }
+
         /// Rows of all KV heads (q-head major, token minor) as (out, lse, boundary) arrays.
         fn arrays<'py>(
             py: Python<'py>,
@@ -195,6 +306,7 @@ mod _native {
             exact: bool,
             hnsw_ef: Option<usize>,
         ) -> PyResult<Self> {
+            let paths: Vec<((usize, usize), String)> = shards.clone();
             let shards = shards
                 .into_iter()
                 .map(|(k, p)| {
@@ -207,14 +319,93 @@ mod _native {
                     Ok((k, v))
                 })
                 .collect::<PyResult<HashMap<_, _>>>()?;
+            let values = Self::load_sidecars(&paths)?;
 
             Ok(Self {
                 shards,
+                values,
                 exact,
                 hnsw_ef,
                 tails: HashMap::new(),
                 kernel: Kernel::detect(),
             })
+        }
+
+        /// Number of shards whose values come from a sidecar (by offset) rather than from Qdrant.
+        #[getter]
+        fn sidecar_shards(&self) -> usize {
+            self.values.len()
+        }
+
+        /// Write every shard's "value" vectors to its VALUES_SIDECAR ([n_points, d] f32, row =
+        /// point id; ids must be 0..n_points, as `prefill` uploads them) and switch decode to
+        /// reading values by offset. Run once per edge folder. Returns the shards written.
+        fn export_values(&mut self, paths: Vec<((usize, usize), String)>) -> PyResult<usize> {
+            let err = |m: String| PyRuntimeError::new_err(format!("export_values: {m}"));
+            // one shard at a time: a 1M-token shard's values are 1 GB
+            let written = paths
+                .iter()
+                .map(|(k, p)| {
+                    let shard = self
+                        .shards
+                        .get(k)
+                        .ok_or_else(|| format!("no loaded shard {k:?} for {p}"))?;
+                    let n = shard.info().map_err(|e| e.to_string())?.points_count;
+                    let mut buf: Vec<f32> = Vec::new();
+                    let mut d = 0usize;
+                    let mut seen = 0usize;
+                    for start in (0..n).step_by(4096) {
+                        let ids = (start..(start + 4096).min(n))
+                            .map(|i| PointId::NumId(i as u64))
+                            .collect();
+                        let recs = shard
+                            .retrieve(
+                                RetrieveRequestBuilder::new(ids)
+                                    .with_payload(WithPayloadInterface::Bool(false))
+                                    .with_vector(WithVector::Selector(vec!["value".to_string()]))
+                                    .build(),
+                            )
+                            .map_err(|e| e.to_string())?;
+                        for r in recs {
+                            let PointId::NumId(id) = r.id else {
+                                return Err("non-numeric point id".to_string());
+                            };
+                            let Some(VectorStructInternal::Named(mut named)) = r.vector else {
+                                return Err(format!("point {id} has no named vectors"));
+                            };
+                            let Some(VectorInternal::Dense(v)) = named.remove("value") else {
+                                return Err(format!("point {id} has no dense 'value'"));
+                            };
+                            if d == 0 {
+                                d = v.len();
+                                buf = vec![0.0; n * d];
+                            }
+                            let id = id as usize;
+                            buf[id * d..(id + 1) * d].copy_from_slice(&v);
+                            seen += 1;
+                        }
+                    }
+                    if seen != n {
+                        return Err(format!("{p}: found {seen} of ids 0..{n}; ids must be 0..n"));
+                    }
+                    let tmp = Path::new(p).join(format!("{VALUES_SIDECAR}.tmp"));
+                    let mut f = std::io::BufWriter::new(
+                        File::create(&tmp).map_err(|e| e.to_string())?,
+                    );
+                    for x in &buf {
+                        f.write_all(&x.to_le_bytes()).map_err(|e| e.to_string())?;
+                    }
+                    let f = f.into_inner().map_err(|e| e.to_string())?;
+                    f.sync_all().map_err(|e| e.to_string())?;
+                    std::fs::rename(&tmp, Path::new(p).join(VALUES_SIDECAR))
+                        .map_err(|e| e.to_string())?;
+                    Ok(())
+                })
+                .collect::<Result<Vec<()>, String>>()
+                .map_err(err)?
+                .len();
+            self.values = Self::load_sidecars(&paths)?;
+            Ok(written)
         }
 
         /// `"exact"`, `"hnsw ef N"`, or `"hnsw ef default"` when unset.
