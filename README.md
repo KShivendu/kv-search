@@ -62,6 +62,24 @@ session exits at EOF:
 uv run kv-search chat -r native -g 512 < prompt.txt
 ```
 
+#### Faster `-r native` decode: values sidecar
+
+Once per edge folder, write each shard's values to a `values.f32` sidecar. `-r native` then reads
+values by offset instead of asking Qdrant for them, and runs a layer's 16 searches in parallel.
+Outputs are unchanged, bit for bit; without sidecars the old path runs.
+
+```sh
+.venv/bin/python -c "
+from kv_search.cache import QdrantEdgeNativeRetriever as R
+r = R(edge_root='cache/niah/qwen3_5/edge')  # chat -r native's folder (edge_proj with --proj)
+print(r._engine.export_values([((L, h), f'{r.edge_root}/layer{L:02d}_head{h}')
+                               for L in range(3, 32, 4) for h in range(4)]))"
+```
+
+The sidecars add 1 KB per key per shard (the values again, as f32). On CPU at 128K keys this cut
+the engine's time from 43 to 28.5 ms per token (8 layers × 16 searches); see
+`scripts/native_profile/`.
+
 #### Tail correction (tailM)
 
 `--tailm` puts back the softmax mass of the prefill keys the retrieval dropped, per head, from the

@@ -16,6 +16,14 @@ class NativeEdgeRetriever:
     @property
     def search_mode(self) -> str:
         """`"exact"` or `"hnsw ef N"`."""
+    @property
+    def sidecar_shards(self) -> int:
+        """Shards whose values are read by offset from a `values.f32` sidecar."""
+    def export_values(self, shards: list[tuple[tuple[int, int], str]]) -> int:
+        """Write each shard's "value" vectors to `<shard>/values.f32` (f32 [n_points, d], row =
+        point id) and switch decode to reading values from it by offset: one search per query
+        row, run in parallel, no vector payload from Qdrant. Same outputs, bit for bit. Run once
+        per edge folder; later loads pick the sidecars up. Returns the shards written."""
     def retrieve(
         self,
         layer_idx: int,
