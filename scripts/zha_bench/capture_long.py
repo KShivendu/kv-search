@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.qwen3_5 import modeling_qwen3_5 as mq
 
@@ -79,6 +79,7 @@ def main() -> None:
         "lib/collection/src", "lib/segment/src", "lib/storage/src", "src", "lib/shard/src"])
     ap.add_argument("--lengths", type=int, nargs="+", default=[16384, 32768, 65536, 131072])
     ap.add_argument("--gen", type=int, default=256)
+    ap.add_argument("--skip-done", action="store_true")
     ap.add_argument("--ask-at", type=int, nargs="*", default=None,
                     help="checkpoints to run questions at (default: all)")
     ap.add_argument("--questions", nargs="+", required=True)
@@ -118,7 +119,7 @@ def main() -> None:
                 cache = o.past_key_values
                 pos += step
                 print(f"  prefill {pos}/{N}  {time.time() - t0:.0f}s", flush=True)
-            if n == lengths[-1]:
+            if n == lengths[-1] and not (out_dir / "keys.safetensors").exists():
                 save_keys(cache, full, out_dir)
             gc.collect()
             ctypes.CDLL("libc.so.6").malloc_trim(0)
@@ -127,6 +128,13 @@ def main() -> None:
             qt: dict[str, torch.Tensor] = {}
             runs = []
             for j, q in enumerate(args.questions):
+                if args.skip_done and (out_dir / f"q_{n}.safetensors").exists():
+                    prev = load_file(out_dir / f"q_{n}.safetensors")
+                    if f"q_{full[0]}_{j}" in prev:
+                        qt.update({k: v for k, v in prev.items() if k.endswith(f"_{j}")})
+                        runs.append(json.loads((out_dir / "meta.json").read_text())
+                                    ["runs"].get(str(n), [{}] * (j + 1))[j])
+                        continue
                 # close the user turn mid-context, then ask
                 q_txt = post_txt + tok.apply_chat_template(
                     [{"role": "user", "content": q}], tokenize=False,
@@ -147,7 +155,10 @@ def main() -> None:
                 for L in full:
                     qt[f"q_{L}_{j}"] = torch.cat(REC[L], dim=1).half().contiguous()
                 REC.clear()
-                del c
+                del c, o  # o.past_key_values still holds this question's cache copy
+                gc.collect()
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+                save_file(qt, out_dir / f"q_{n}.safetensors")  # partial: survives a later kill
                 ans = tok.decode(gen, skip_special_tokens=True)
                 runs.append({"q_tokens": q_ids.shape[1], "gen": len(gen), "answer": ans})
                 print(f"[{n}] Q{j}: {len(gen)} tok  {ans[:120]!r}  ({time.time() - t0:.0f}s)", flush=True)

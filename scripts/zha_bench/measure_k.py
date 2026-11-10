@@ -22,6 +22,7 @@ from pathlib import Path
 
 import faiss
 import numpy as np
+from safetensors import safe_open
 from safetensors.numpy import load_file
 
 G = 4
@@ -100,7 +101,8 @@ class Graph:
 
 def run_shard(job):
     d, L, h, lengths, n_q, k, efs = job
-    K_all = load_file(str(Path(d) / "keys.safetensors"))[f"k_{L}"][h].astype(np.float32)
+    with safe_open(str(Path(d) / "keys.safetensors"), framework="np") as f:
+        K_all = f.get_slice(f"k_{L}")[h:h + 1][0].astype(np.float32)
     dim = K_all.shape[1]
     index = faiss.IndexHNSWFlat(dim, 16, faiss.METRIC_INNER_PRODUCT)
     index.hnsw.efConstruction = 100
@@ -111,7 +113,8 @@ def run_shard(job):
         index.add(K_all[built:n])
         built = n
         g = Graph(index, K_all[:n])
-        qs = load_file(str(Path(d) / f"q_{n}.safetensors"))
+        with safe_open(str(Path(d) / f"q_{n}.safetensors"), framework="np") as f:
+            qs = {k: f.get_tensor(k) for k in f.keys() if k.startswith(f"q_{L}_")}
         for j in range(n_q):
             Q = qs[f"q_{L}_{j}"][h * G:(h + 1) * G].astype(np.float32)  # [G, T, d]
             T = Q.shape[1]
@@ -157,7 +160,8 @@ def main():
         for r in ex.map(run_shard, jobs):
             res += r
             print(f"shard L{r[0]['layer']} h{r[0]['head']} done {time.time() - t0:.0f}s", flush=True)
-    (Path(args.dir) / "k_results.json").write_text(json.dumps(res))
+    tag = "_".join(str(n) for n in lengths)
+    (Path(args.dir) / f"k_results_{tag}.json").write_text(json.dumps(res))
     print(f"{'n':>7} {'ef':>4} {'K%':>6} {'V%':>6} {'K/V':>5} {'recall':>6} {'vis/q':>6} {'K% after question':>18}")
     for n in lengths:
         for ef in args.ef:
